@@ -250,28 +250,74 @@ def main():
 
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="b1", choices=list(CONFIGS))
-    p.add_argument("--gpu", default="H100", choices=["H100", "A100", "B200", "L4"])
+    p.add_argument("--gpu", default="H100",
+                   choices=["H100", "A100", "B200", "L4", "RTX4090", "RTX4080", "RTX3090"])
     p.add_argument("--n-gpu", type=int, default=8)
     p.add_argument("--mfu", type=float, default=0.40)
     p.add_argument("--seq-len", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None)
+    # Speedup multipliers for the new optimisations
+    p.add_argument("--fp8", action="store_true", help="FP8 (2x throughput on Ada/Hopper)")
+    p.add_argument("--mod-skip-rate", type=float, default=0.0,
+                   help="MoD skip rate (0.5 → ~1.7x speedup)")
+    p.add_argument("--pgsu-density", type=float, default=1.0,
+                   help="PGSU final density (0.10 → ~1.5x on memory-bound)")
+    p.add_argument("--progressive-depth", action="store_true",
+                   help="Progressive depth (~1.3x average)")
+    p.add_argument("--checkpointing", action="store_true",
+                   help="Activation checkpointing (no compute saving, enables larger batch)")
     args = p.parse_args()
 
     gpu_specs = {
-        "H100": 990.0,    # bf16 dense, SXM5
-        "A100": 312.0,    # bf16 dense, SXM4 80GB
-        "B200": 2250.0,   # bf16 dense, Blackwell
-        "L4":   120.0,
+        "H100":    990.0,    # bf16 dense, SXM5
+        "A100":    312.0,    # bf16 dense, SXM4 80GB
+        "B200":   2250.0,    # bf16 dense, Blackwell
+        "L4":      120.0,
+        "RTX4090":  82.0,    # consumer Ada, bf16 dense (24GB VRAM)
+        "RTX4080":  49.0,    # AD103
+        "RTX3090":  35.0,    # Ampere consumer
     }
 
     cfg = CONFIGS[args.config]
     print(describe_config(cfg))
     print()
 
+    # Compute combined speedup multiplier
+    speedup = 1.0
+    notes = []
+    if args.fp8:
+        speedup *= 2.0
+        notes.append("FP8 (2x)")
+    if args.mod_skip_rate > 0:
+        # 1 / (1 - skip_rate * 0.7) — token skip doesn't perfectly map to compute skip
+        mod_speedup = 1.0 / max(0.3, 1.0 - args.mod_skip_rate * 0.7)
+        speedup *= mod_speedup
+        notes.append(f"MoD skip={args.mod_skip_rate} ({mod_speedup:.2f}x)")
+    if args.pgsu_density < 1.0:
+        # PGSU speedup: optimizer is ~40% of step on memory-bound GPUs (4090).
+        # At density d, optimizer step is d × original. Speedup = 1 / (0.6 + 0.4*d)
+        pgsu_speedup = 1.0 / (0.6 + 0.4 * args.pgsu_density)
+        speedup *= pgsu_speedup
+        notes.append(f"PGSU density={args.pgsu_density} ({pgsu_speedup:.2f}x)")
+    if args.progressive_depth:
+        # Average active layers ~ 0.65 of full → 1/0.65 = 1.54x
+        speedup *= 1.54
+        notes.append("Progressive depth (1.54x)")
+    if args.checkpointing:
+        # No wall-clock compute saving, but enables ~2x larger batch which
+        # improves GPU utilisation by ~1.1x
+        speedup *= 1.1
+        notes.append("Activation checkpointing (1.1x via larger batch)")
+
+    if notes:
+        print(f"[speedups] {' + '.join(notes)} = {speedup:.2f}x combined")
+        print(f"[effective] {gpu_specs[args.gpu]:.0f} TFLOPS × {args.mfu:.2f} MFU × {speedup:.2f}x = "
+              f"{gpu_specs[args.gpu] * args.mfu * speedup * args.n_gpu:.0f} TFLOPS effective\n")
+
     plan = plan_chinchilla(
         cfg,
         gpu_name=args.gpu,
-        gpu_tflops=gpu_specs[args.gpu],
+        gpu_tflops=gpu_specs[args.gpu] * speedup,  # apply combined speedup
         gpu_count=args.n_gpu,
         gpu_mfu=args.mfu,
         batch_size=args.batch_size,

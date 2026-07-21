@@ -46,6 +46,7 @@ from kuro_brain.model import KAHNN, KAHNNConfig
 from kuro_brain.continuous_learning import OnlineLearner
 from kuro_brain.config import CONFIGS, describe_config
 from kuro_brain.chinchilla import plan_chinchilla
+from kuro_brain.pgsu import build_pgsu_adamw, PGSU
 from data import build_tokenizer, StreamingCorpus, TokenBatcher
 
 
@@ -117,6 +118,49 @@ def parse_args():
     p.add_argument("--bf16", action="store_true", default=True)
     p.add_argument("--no-bf16", dest="bf16", action="store_false")
 
+    # PGSU — Progressive Gradient Sparsification Update
+    p.add_argument("--pgsu", action="store_true",
+                   help="Enable PGSU gradient sparsification wrapper.")
+    p.add_argument("--pgsu-target-density", type=float, default=0.10,
+                   help="Final gradient density (0.10 = 90%% sparse).")
+    p.add_argument("--pgsu-schedule", default="cosine",
+                   choices=["linear", "cosine", "step", "exp"],
+                   help="Density schedule shape.")
+    p.add_argument("--pgsu-warmup", type=int, default=200,
+                   help="Dense steps before sparsification begins.")
+
+    # 8-bit optimizer
+    p.add_argument("--use-8bit-optimizer", action="store_true",
+                   help="Use bitsandbytes AdamW8bit (saves ~75%% optim memory).")
+
+    # Progressive depth — start with N layers, grow one every K steps
+    p.add_argument("--progressive-depth", action="store_true",
+                   help="Start with fewer layers and grow during training.")
+    p.add_argument("--initial-layers", type=int, default=None,
+                   help="Initial active layer count (default: n_layers // 4).")
+    p.add_argument("--grow-every-steps", type=int, default=None,
+                   help="Add a new layer every N steps (default: total_steps / n_layers).")
+
+    # FP8 (Ada/Hopper) — 2x throughput
+    p.add_argument("--fp8", action="store_true",
+                   help="Use FP8 (e4m3) for matmuls on Ada/Hopper. 2x throughput vs bf16.")
+
+    # Mixture-of-Depths — token-level early exit
+    p.add_argument("--mod", action="store_true",
+                   help="Enable Mixture-of-Depths token early-exit routing.")
+    p.add_argument("--mod-skip-rate", type=float, default=0.5,
+                   help="Fraction of tokens that skip each layer (default 0.5).")
+    p.add_argument("--mod-aux-weight", type=float, default=0.01,
+                   help="Weight for the MoD auxiliary loss.")
+
+    # Activation checkpointing
+    p.add_argument("--activation-checkpointing", action="store_true",
+                   help="Recompute forward in backward (saves VRAM, +30%% compute).")
+
+    # CPU offload of optimizer state
+    p.add_argument("--cpu-offload", action="store_true",
+                   help="Pin AdamW state to CPU RAM (saves ~8GB VRAM for B1).")
+
     # Multi-GPU
     p.add_argument("--ddp", action="store_true",
                    help="Enable DistributedDataParallel (use with torchrun).")
@@ -180,7 +224,19 @@ def main():
     else:
         cfg = CONFIGS[args.config]
         cfg.max_seq_len = args.seq_len
+
+    # Apply speed-optimisation flags to the config (these change model
+    # construction — must happen before KAHNN() is built)
+    cfg.use_mod = args.mod
+    cfg.mod_skip_rate = args.mod_skip_rate
+    cfg.use_activation_checkpointing = args.activation_checkpointing
     log(f"[config] {describe_config(cfg)}")
+    if args.mod:
+        log(f"[mod] Mixture-of-Depths enabled, skip_rate={args.mod_skip_rate}")
+    if args.activation_checkpointing:
+        log(f"[ckpt] activation checkpointing enabled (+30% compute, -50% activation VRAM)")
+    if args.fp8:
+        log(f"[fp8] FP8 autocast enabled (Ada/Hopper, 2x throughput)")
 
     # 2) Chinchilla plan (for sanity)
     plan = plan_chinchilla(
@@ -219,15 +275,142 @@ def main():
                 no_decay.append(p)
             else:
                 decay.append(p)
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": decay, "weight_decay": args.weight_decay},
-                {"params": no_decay, "weight_decay": 0.0},
-            ],
-            lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
+
+        # We need total_steps for PGSU's density schedule
+        tokens_per_step_pre = args.micro_batch * args.seq_len * world * args.grad_accum
+        total_steps_pre = max(1, args.max_tokens // tokens_per_step_pre)
+
+        if args.pgsu:
+            # PGSU wraps its own base optimizer (AdamW or AdamW8bit)
+            # Build with two param groups: decay + no_decay
+            # PGSU's factory takes a flat param list, so we'll construct
+            # it manually here to keep the two groups.
+            from kuro_brain.pgsu import PGSU
+            if args.use_8bit_optimizer:
+                try:
+                    import bitsandbytes as bnb
+                    base = bnb.optim.AdamW8bit(
+                        [
+                            {"params": decay, "weight_decay": args.weight_decay},
+                            {"params": no_decay, "weight_decay": 0.0},
+                        ],
+                        lr=args.lr, betas=(0.9, 0.95), eps=1e-8, optim_bits=8,
+                    )
+                    log("[optim] PGSU + AdamW8bit (bitsandbytes)")
+                except ImportError:
+                    log("[optim] WARNING: --use-8bit-optimizer but bitsandbytes not installed, falling back to AdamW")
+                    base = torch.optim.AdamW(
+                        [
+                            {"params": decay, "weight_decay": args.weight_decay},
+                            {"params": no_decay, "weight_decay": 0.0},
+                        ],
+                        lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
+                    )
+            else:
+                base = torch.optim.AdamW(
+                    [
+                        {"params": decay, "weight_decay": args.weight_decay},
+                        {"params": no_decay, "weight_decay": 0.0},
+                    ],
+                    lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
+                )
+                log("[optim] PGSU + AdamW")
+            optimizer = PGSU(
+                base,
+                total_steps=total_steps_pre,
+                target_density=args.pgsu_target_density,
+                schedule=args.pgsu_schedule,
+                warmup_steps=args.pgsu_warmup,
+                verbose=is_main(rank),
+            )
+            log(f"[optim] PGSU: target_density={args.pgsu_target_density} "
+                f"schedule={args.pgsu_schedule} warmup={args.pgsu_warmup}")
+        else:
+            if args.use_8bit_optimizer:
+                try:
+                    import bitsandbytes as bnb
+                    optimizer = bnb.optim.AdamW8bit(
+                        [
+                            {"params": decay, "weight_decay": args.weight_decay},
+                            {"params": no_decay, "weight_decay": 0.0},
+                        ],
+                        lr=args.lr, betas=(0.9, 0.95), eps=1e-8, optim_bits=8,
+                    )
+                    log(f"[optim] AdamW8bit lr={args.lr} wd={args.weight_decay} "
+                        f"betas=(0.9,0.95) decay_groups={len(decay)} no_decay={len(no_decay)}")
+                except ImportError:
+                    log("[optim] WARNING: --use-8bit-optimizer but bitsandbytes not installed, falling back to AdamW")
+                    optimizer = torch.optim.AdamW(
+                        [
+                            {"params": decay, "weight_decay": args.weight_decay},
+                            {"params": no_decay, "weight_decay": 0.0},
+                        ],
+                        lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
+                    )
+                    log(f"[optim] AdamW lr={args.lr} wd={args.weight_decay} "
+                        f"betas=(0.9,0.95) decay_groups={len(decay)} no_decay={len(no_decay)}")
+            else:
+                optimizer = torch.optim.AdamW(
+                    [
+                        {"params": decay, "weight_decay": args.weight_decay},
+                        {"params": no_decay, "weight_decay": 0.0},
+                    ],
+                    lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
+                )
+                log(f"[optim] AdamW lr={args.lr} wd={args.weight_decay} "
+                    f"betas=(0.9,0.95) decay_groups={len(decay)} no_decay={len(no_decay)}")
+
+    # 5b) Progressive depth setup
+    if args.progressive_depth:
+        initial = args.initial_layers or max(1, cfg.n_layers // 4)
+        grow_every = args.grow_every_steps or max(
+            1, (total_steps_pre - args.pgsu_warmup) // max(1, cfg.n_layers - initial)
         )
-        log(f"[optim] AdamW lr={args.lr} wd={args.weight_decay} "
-            f"betas=(0.9,0.95) decay_groups={len(decay)} no_decay={len(no_decay)}")
+        raw_model.set_active_layers(initial)
+        log(f"[progressive-depth] initial_active={initial}/{cfg.n_layers} "
+            f"grow_every={grow_every} steps")
+        # State for grow schedule
+        progressive_state = {"initial": initial, "grow_every": grow_every,
+                             "next_grow_at": initial * grow_every if initial > 0 else grow_every}
+    else:
+        progressive_state = None
+
+    # 5c) CPU offload of optimizer state (simple version: keep params/grads
+    # on GPU, but the optimizer's Adam m+v state lives on CPU pinned memory).
+    # We do this by intercepting optimizer.step() — the state is moved to
+    # GPU for the step, then back to CPU. For B1 this saves ~8 GB VRAM.
+    # The hook is a simple pre-step / post-step pair below.
+    if args.cpu_offload and optimizer is not None:
+        log("[cpu-offload] optimizer state will be pinned to CPU RAM")
+        # Pin existing state to CPU
+        for group in optimizer.param_groups if not isinstance(optimizer, PGSU) else optimizer.base.param_groups:
+            for p in group["params"]:
+                if p in (optimizer.state if not isinstance(optimizer, PGSU) else optimizer.base.state):
+                    st = (optimizer.state if not isinstance(optimizer, PGSU) else optimizer.base.state)[p]
+                    for k, v in st.items():
+                        if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+                            st[k] = v.to("cpu", non_blocking=True)
+        # Patch step to move state to GPU before, back to CPU after
+        if not isinstance(optimizer, PGSU):
+            orig_step = optimizer.step
+            def patched_step(closure=None):
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p in optimizer.state:
+                            for k, v in optimizer.state[p].items():
+                                if isinstance(v, torch.Tensor) and v.device.type == "cpu":
+                                    optimizer.state[p][k] = v.to(p.device, non_blocking=True)
+                out = orig_step(closure)
+                for group in optimizer.param_groups:
+                    for p in group["params"]:
+                        if p in optimizer.state:
+                            for k, v in optimizer.state[p].items():
+                                if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+                                    optimizer.state[p][k] = v.to("cpu", non_blocking=True)
+                return out
+            optimizer.step = patched_step
+        else:
+            log("[cpu-offload] PGSU-wrapped optimizer: CPU offload not yet supported, skipping")
 
     learner = OnlineLearner(raw_model, cfg, base_optimizer=optimizer,
                             continuous_mode=args.continuous)
@@ -327,19 +510,31 @@ def main():
         # Optimiser step with gradient accumulation
         optimizer.zero_grad(set_to_none=True) if optimizer is not None else None
         accum_loss = 0.0
+        accum_mod_loss = 0.0
         for micro in range(args.grad_accum):
             mx = x[micro::args.grad_accum]   # stride split for accumulation
             my = y[micro::args.grad_accum]
             if mx.shape[0] == 0:
                 continue
-            with amp_ctx:
+            # FP8 autocast wraps the forward — eligible matmuls use fp8 e4m3
+            # on Ada/Hopper. Falls back to bf16 on other hardware.
+            from kuro_brain.fp8 import fp8_autocast
+            with amp_ctx, fp8_autocast(enabled=args.fp8):
                 logits = model(mx)
-                loss = F.cross_entropy(
+                # Compute per-token CE for MoD aux loss
+                ce_per_token = F.cross_entropy(
                     logits.reshape(-1, cfg.vocab_size),
                     my.reshape(-1),
-                ) / args.grad_accum
-            loss.backward()
-            accum_loss += float(loss.item()) * args.grad_accum
+                    reduction="none",
+                ).view(mx.shape[0], -1)  # [B, T]
+                loss_main = ce_per_token.mean() / args.grad_accum
+            # Add MoD aux loss if enabled
+            mod_aux = getattr(raw_model, "_last_mod_loss",
+                              torch.tensor(0.0, device=device))
+            total_micro_loss = loss_main + args.mod_aux_weight * mod_aux / args.grad_accum
+            total_micro_loss.backward()
+            accum_loss += float(loss_main.item()) * args.grad_accum
+            accum_mod_loss += float(mod_aux.item()) / args.grad_accum if isinstance(mod_aux, torch.Tensor) else 0.0
 
         # AllReduce gradients if DDP — DDP already does this in backward(),
         # but we still need to sync the OnlineLearner's local rule across ranks.
@@ -363,6 +558,18 @@ def main():
         # (operates on raw_model — DDP wrapper is transparent)
         learner.step(x, y, torch.tensor(accum_loss, device=device))
 
+        # Progressive depth: grow a new layer every `grow_every` steps.
+        # Each rank decides independently based on the global step counter
+        # — they stay in sync because they all use the same step number.
+        if progressive_state is not None and step >= progressive_state["next_grow_at"]:
+            new_count = raw_model.activate_next_layer()
+            if new_count is not None:
+                progressive_state["next_grow_at"] += progressive_state["grow_every"]
+                log(f"[progressive-depth] step={step} activated layer {new_count}/"
+                    f"{cfg.n_layers}")
+            else:
+                progressive_state["next_grow_at"] = float("inf")  # stop growing
+
         step += 1
         tokens_seen += tokens_per_step
         running_loss += accum_loss * (x.numel() * args.grad_accum)
@@ -376,8 +583,13 @@ def main():
             eta_h = eta_s / 3600.0
             lr_now = lr_at_step(step, total_steps, warmup_steps,
                                 args.lr, args.min_lr_frac)
+            active = raw_model.n_active_layers if hasattr(raw_model, "n_active_layers") else cfg.n_layers
+            pgsu_density = ""
+            if isinstance(optimizer, PGSU):
+                pgsu_density = f" density={optimizer.stats()['current_density']:.3f}"
             log(f"[step {step:5d}/{total_steps}] loss={avg:.4f} "
                 f"lr={lr_now:.2e} tps={tps/1e6:.2f}M "
+                f"layers={active}/{cfg.n_layers}{pgsu_density} "
                 f"engram={learner.state()['engram_usage_mean']:.2f} "
                 f"eta={eta_h:.1f}h")
             running_loss = 0.0

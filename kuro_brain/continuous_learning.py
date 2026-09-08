@@ -76,11 +76,12 @@ class OnlineLearner:
         self.cfg = cfg
         self.base_optimizer = base_optimizer
         self.continuous_mode = continuous_mode
+        # During Adam pretraining the local Hebbian re-forward is largely
+        # redundant with backprop and is extremely expensive on CPU
+        # (another full Kuramoto stack + [B,T,E,D] tensors). Keep it for
+        # continuous_mode / post-training; skip by default in pretrain.
+        self.enable_local_plasticity = continuous_mode
         self._step = 0
-
-    # ------------------------------------------------------------------
-    # Main entry
-    # ------------------------------------------------------------------
 
     def step(
         self,
@@ -97,41 +98,24 @@ class OnlineLearner:
         """
         self._step += 1
 
-        # 1) Base optimizer step (Adam on global params) — only in
-        #    pretraining mode OR when explicitly requested.
         if self.base_optimizer is not None and not self.continuous_mode:
             self.base_optimizer.step()
             self.base_optimizer.zero_grad(set_to_none=True)
 
-        # 2) Local phase-based plasticity for U, V in every Kuramoto layer.
-        #    This is a Hebbian/anti-Hebbian rule modulated by error.
-        self._local_phase_plasticity(token_ids, loss)
+        # Skipped during Adam pretraining unless explicitly enabled
+        # (see enable_local_plasticity) — saves ~1 full forward pass/step.
+        if self.enable_local_plasticity or self.continuous_mode:
+            self._local_phase_plasticity(token_ids, loss)
 
-        # 3) Write engrams if coherence is high enough.
         if self._step % self.cfg.engram_write_every == 0:
             self._maybe_consolidate_engrams(token_ids)
 
-        # 4) In continuous mode, decay engrams (active forgetting).
         if self.continuous_mode:
             self.model.memory.decay(rate=0.9995)
 
-    # ------------------------------------------------------------------
-    # Local plasticity
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
     def _local_phase_plasticity(self, token_ids: Tensor, loss: Tensor):
-        """
-        For each Kuramoto layer, compute a one-step phase evolution from
-        the current input, then apply the local rule:
-
-            ΔU[i, r] = η · err · <sin(θ - θ_engram_nearest)>_i · V_proj[r]
-            ΔV[i, r] = η · err · <cos(θ - θ_engram_nearest)>_i · U_proj[r]
-
-        where θ_engram_nearest is the closest attractor engram to the
-        current phase state. This is a phase-coherence-gated Hebbian
-        update — biologically plausible (local, no global gradient).
-        """
+        """Phase-coherence-gated Hebbian update without [B,T,E,D] tensors."""
         err = float(loss.clamp(-2.0, 2.0).item())
         lr = self.cfg.online_lr_phase * err
 
@@ -140,55 +124,38 @@ class OnlineLearner:
 
         x = self.model.tokenizer.encode(token_ids)  # [B, T, D]
         for i, layer in enumerate(self.model.layers):
+            if hasattr(self.model, "n_active_layers") and i >= self.model.n_active_layers:
+                break
             theta = hv_to_phase(x)                  # [B, T, D]
-            # Find nearest engram for this layer
             engrams = layer.engrams                 # [E, D]
-            # coherence per engram: cos(θ - θ_engram).mean over D
-            diff = engrams.unsqueeze(0).unsqueeze(0) - theta.unsqueeze(2)  # [B, T, E, D]
-            coh = torch.cos(diff).mean(dim=-1)      # [B, T, E]
-            best = coh.argmax(dim=-1, keepdim=True)  # [B, T, 1]
-            # Pull nearest engram phase
-            nearest_engram = engrams[best.squeeze(-1)]  # [B, T, D]
-            # Plasticity signals:
-            sin_pull = torch.sin(nearest_engram - theta).mean(dim=(0, 1))   # [D]
-            cos_pull = torch.cos(nearest_engram - theta).mean(dim=(0, 1))   # [D]
-            # Apply: U += lr * sin_pull ⊗ V_proj_mean ; V += lr * cos_pull ⊗ U_proj_mean
-            # We use a cheap projection to rank-r.
-            V_proj = (layer.V.data * sin_pull.unsqueeze(1)).mean(dim=0)     # [rank]
-            U_proj = (layer.U.data * cos_pull.unsqueeze(1)).mean(dim=0)     # [rank]
+            D = engrams.shape[-1]
+            sin_t, cos_t = torch.sin(theta), torch.cos(theta)
+            sin_e, cos_e = torch.sin(engrams), torch.cos(engrams)
+            coh = (cos_t @ cos_e.t() + sin_t @ sin_e.t()) / D   # [B, T, E]
+            best = coh.argmax(dim=-1)                            # [B, T]
+            nearest_engram = engrams[best]                       # [B, T, D]
+            sin_pull = torch.sin(nearest_engram - theta).mean(dim=(0, 1))
+            cos_pull = torch.cos(nearest_engram - theta).mean(dim=(0, 1))
+            V_proj = (layer.V.data * sin_pull.unsqueeze(1)).mean(dim=0)
+            U_proj = (layer.U.data * cos_pull.unsqueeze(1)).mean(dim=0)
             layer.U.data += lr * sin_pull.unsqueeze(1) * V_proj.unsqueeze(0)
             layer.V.data += lr * cos_pull.unsqueeze(1) * U_proj.unsqueeze(0)
-            # Move x forward for next layer (use the layer's actual forward)
             x = layer(x)
-
-    # ------------------------------------------------------------------
-    # Engram consolidation
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def _maybe_consolidate_engrams(self, token_ids: Tensor):
-        """
-        Write the current phase state into the per-layer and cross-layer
-        attractor memory, but only if its self-coherence exceeds the
-        threshold (i.e. it's a "stable thought" worth remembering).
-        """
+        """Write phase state into attractor memory if coherence is high."""
         x = self.model.tokenizer.encode(token_ids)
         for i, layer in enumerate(self.model.layers):
             x = layer(x)
-            theta = hv_to_phase(x)                    # [B, T, D]
-            # Global coherence: how aligned are the phases across B,T,D?
-            # Use order parameter r = |<exp(iθ)>|
-            z = torch.exp(1j * theta).mean(dim=(0, 1))   # complex [D]
+            theta = hv_to_phase(x)
+            z = torch.exp(1j * theta).mean(dim=(0, 1))
             r = z.abs().mean().item()
             if r >= self.cfg.engram_coherence_threshold:
                 mean_hv = x.mean(dim=(0, 1))
                 mean_theta = hv_to_phase(mean_hv)
                 slot = layer.write_engram(mean_theta)
                 self.model.memory.write(i, mean_theta)
-
-    # ------------------------------------------------------------------
-    # State inspection
-    # ------------------------------------------------------------------
 
     def state(self) -> dict:
         return {

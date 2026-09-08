@@ -8,3 +8,9 @@ runs/
 .venv/
 .DS_Store
 *.log
+
+# Large local corpus (document in data/DATA.md; rebuild locally)
+data/corpus.txt
+data/raw/
+data/code/
+!data/DATA.md

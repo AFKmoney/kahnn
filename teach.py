@@ -50,7 +50,8 @@ def _encode_text(text: str, cfg, device, max_len: int = 128) -> torch.Tensor:
         return torch.tensor([ids], dtype=torch.long, device=device)
     import tiktoken
     enc = tiktoken.get_encoding("gpt2")
-    ids = enc.encode(text)[:max_len] or [enc.eot_token]
+    # encode_ordinary: literal <|endoftext|> must not ValueError
+    ids = enc.encode_ordinary(text)[:max_len] or [enc.eot_token]
     return torch.tensor([ids], dtype=torch.long, device=device)
 
 

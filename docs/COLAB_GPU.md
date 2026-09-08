@@ -21,13 +21,11 @@ Notebook : [`notebooks/kahnn_nano_colab.ipynb`](../notebooks/kahnn_nano_colab.ip
    - Free : souvent **T4** (~15–16 Go)
    - Pro / Pro+ : parfois **L4**, A100, etc. (quota variable)
 
-Lien direct typique (branche `main` après merge) :
+Lien direct (branche `main`) :
 
 ```text
 https://colab.research.google.com/github/AFKmoney/kahnn/blob/main/notebooks/kahnn_nano_colab.ipynb
 ```
-
-Avant merge de la PR Colab, remplace `main` par `feat/colab-nano-gpu`.
 
 ## 2. Free vs Pro (limites pratiques)
 
@@ -35,12 +33,12 @@ Avant merge de la PR Colab, remplace `main` par `feat/colab-nano-gpu`.
 |--|------|-------------------------|
 | GPU | T4 souvent | T4 / L4 / parfois mieux |
 | Durée session | Coupures idle + plafond journalier | Sessions plus longues, moins de files |
-| Disque `/content` | Éphémère | Idem — **Drive obligatoire** pour les gros ckpt |
+| Disque `/content` | Éphémère | Idem — **Drive recommandé** pour les gros ckpt |
 | Quota | Peut passer en CPU si saturé | Meilleur accès GPU |
 
-Conseil : **monte Google Drive** dès le début. Un `ckpt_*.pt` nano fait
-environ **~846 MiB** (mesure box) — trop gros pour « tout re-télécharger
-chaque fois » sans Drive.
+Conseil : le notebook a **`USE_DRIVE=False` par défaut** pour éviter le
+blocage d’auth interactive. Passe à `True` quand tu veux persister les
+ckpt (~**846 MiB** chacun, mesure box).
 
 ## 3. Transférer un checkpoint depuis la box CPU
 
@@ -65,13 +63,15 @@ ckpt déjà écrit (`ckpt_1500` ou plus tard) et continue sur GPU à côté.
 
 `data/corpus.txt` (~109 MiB) **n’est pas** dans git (voir `data/DATA.md`).
 
-Options Colab :
+Options Colab (dans l’ordre du notebook) :
 
-1. Uploader le `corpus.txt` box → Drive → cellule copie Drive→`/content`
-2. Upload direct dans la session Colab
-3. Rebuild **minimal** Gutenberg + sources repo (cellule notebook) — OK
-   pour smoke ; pour le mix fidèle (TinyStories, Wikipedia, CPython, …)
-   préfère le fichier déjà construit sur la box
+1. Copier depuis Drive si présent (`MyDrive/kahnn/data/corpus.txt`)
+2. **Rebuild minimal** Gutenberg + sources repo (pas besoin de Drive)
+3. Upload interactif **désactivé par défaut** (`DO_UPLOAD=False`) car
+   `files.upload()` bloque la cellule
+
+Pour le mix fidèle (TinyStories, Wikipedia, CPython, …) préfère le fichier
+déjà construit sur la box.
 
 ## 5. Flags Colab sensés (nano / T4)
 
@@ -102,7 +102,20 @@ python teach.py teach \
 
 Détails lifelong : `docs/LIFELONG_LEARNING.md`.
 
-## 7. Ce que Colab ne remplace pas
+## 7. Troubleshooting (Colab « ne marche pas »)
+
+| Symptôme | Cause fréquente | Fix |
+|----------|-----------------|-----|
+| Cellule 0 stop / `cuda_available=False` | Pas de GPU / quota free épuisé | Runtime → GPU ; attendre ; autre compte ; Colab Pro |
+| `drive.mount` bloque / auth interactive | Colab demande un clic OAuth | Garder `USE_DRIVE=False` ; train sur `/content` ; télécharge les ckpt à la main |
+| `git clone` 404 / auth | Branche fausse ou fork privé | Repo **public** `AFKmoney/kahnn` ; `BRANCH="main"` ; fork privé → URL avec token ou zip |
+| Cellule upload qui ne finit jamais | `files.upload()` attend un fichier | `DO_UPLOAD=False` + cellule rebuild Gutenberg |
+| `%pip` / magics fragiles | Environnement shell vs Python | Notebook utilise `subprocess` + `sys.executable -m pip` |
+| OOM T4 | Batch trop gros | `--micro-batch 4`, `--mod`, `--activation-checkpointing` |
+| `ValueError: disallowed special token` (EOT) | Corpus contient le marqueur EOT GPT-2 | Corrigé dans `data.encode_text` (`encode_ordinary`) — tire le dernier `main` |
+| Session morte en cours de train | Idle / déconnexion free | Remonter Drive ou re-uploader le dernier `ckpt_*.pt`, `RESUME=...` |
+
+## 8. Ce que Colab ne remplace pas
 
 - Ce n’est **pas** un cluster B1 / multi-4090
 - Free Colab peut te **remettre en CPU** sans prévenir — vérifie `nvidia-smi`

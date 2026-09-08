@@ -47,7 +47,7 @@ python train_universal.py \
   --config nano --device cpu \
   --max-tokens 2000000 --smoke-steps 30
 
-# Continuer sans Adam (plasticité + engrammes)
+# Continuer sans Adam (lifelong engrammes ; pas de decay auto)
 python train_universal.py \
   --data /path/to/new_domain.txt \
   --output ./runs/commodity_cont \
@@ -62,6 +62,8 @@ Flags utiles :
 - `--activation-checkpointing` : petit GPU VRAM limitée.
 - `--enable-plasticity` : plasticité locale **pendant** Adam (plus lent ;
   réservé au mode continuous en général).
+- `--soft-decay` : avec `--continuous`, age seulement les slots faibles
+  (défaut OFF = mémoire à vie jusqu’à `teach.py forget`).
 
 ## 4. Speedups déjà dans le code (pertinents CPU / petit GPU)
 
@@ -136,4 +138,23 @@ python -m kuro_brain.smoke
 python mini_train.py
 python train_universal.py --data /tmp/kuro_test/tiny.txt \
   --output /tmp/kahnn_uni --config smoke --device cpu --smoke-steps 20
+python teach.py smoke --device cpu
+```
+
+## 10. Après le prétrain : apprentissage à vie
+
+Une fois la base langage+code obtenue (`nano` / `commodity` + corpus
+texte+code), basculez en **continuous lifelong** :
+
+- pas de decay global auto des engrammes (défaut) ;
+- oubli **uniquement** via `teach.py forget` / `learner.forget(...)` ;
+- `--soft-decay` optionnel (slots faibles seulement).
+
+Voir **`docs/LIFELONG_LEARNING.md`** pour le curriculum, l’API teach/forget,
+et les limites honnêtes du « se souvenir pour toujours ».
+
+```bash
+python teach.py teach --text "Fait métier…" --resume ./runs/.../ckpt_final.pt \
+  --config commodity --output ./runs/teach
+python teach.py smoke --device cpu
 ```

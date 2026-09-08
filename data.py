@@ -78,19 +78,16 @@ class StreamingCorpus:
         else:
             files = sorted(p for p in self.path.rglob("*") if p.is_file())
         for f in files:
+            # Stream by chunk so multi-GB corpora do not explode RAM.
+            # Previous impl concatenated the entire file then tokenized once.
             with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                buf = io.StringIO()
                 while True:
                     chunk = fh.read(self.chunk_size)
                     if not chunk:
                         break
-                    buf.write(chunk)
-                text = buf.getvalue()
-                if not text:
-                    continue
-                ids = self.tokenizer.encode(text)
-                for i in ids:
-                    yield i
+                    ids = self.tokenizer.encode(chunk)
+                    for i in ids:
+                        yield i
                 yield self.eos_id
 
 
@@ -126,22 +123,31 @@ class TokenBatcher:
 
     def _worker(self):
         B, T = self.batch_size, self.seq_len
-        buf: list[int] = []
+        need = B * T + 1
+        # Preallocate CPU long buffer; avoid per-token Python list growth +
+        # torch.tensor(list) which is a major CPU I/O bottleneck at scale.
+        buf = torch.empty(need * 4, dtype=torch.long)
+        n_buf = 0
         try:
             while not self._stop.is_set():
-                need = B * T + 1
-                while len(buf) < need:
+                while n_buf < need:
                     try:
-                        buf.append(next(self.stream))
+                        tok = next(self.stream)
                     except StopIteration:
                         self._stop.set()
                         break
-                if self._stop.is_set() and len(buf) < need:
+                    if n_buf >= buf.numel():
+                        buf = torch.cat([buf, torch.empty(buf.numel(), dtype=torch.long)])
+                    buf[n_buf] = tok
+                    n_buf += 1
+                if self._stop.is_set() and n_buf < need:
                     break
-                arr = buf[:need]
-                del buf[:need]
-                x = torch.tensor(arr[:-1], dtype=torch.long, device=self.device).view(B, T)
-                y = torch.tensor(arr[1:], dtype=torch.long, device=self.device).view(B, T)
+                flat = buf[:need].clone()
+                if n_buf > need:
+                    buf[: n_buf - need] = buf[need:n_buf]
+                n_buf = max(0, n_buf - need)
+                x = flat[:-1].view(B, T).to(self.device, non_blocking=True)
+                y = flat[1:].view(B, T).to(self.device, non_blocking=True)
                 self._queue.put((x, y))
         except Exception as e:
             self._queue.put(e)

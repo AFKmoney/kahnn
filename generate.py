@@ -20,7 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from kuro_brain.model import KAHNN, KAHNNConfig
-from data import build_tokenizer
+from data import build_tokenizer, encode_text
 
 
 def parse_args():
@@ -48,7 +48,7 @@ def main():
     model.eval()
 
     tokenizer, _ = build_tokenizer("gpt2")
-    prompt_ids = tokenizer.encode(args.prompt)
+    prompt_ids = encode_text(tokenizer, args.prompt)
     x = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
     out = model.generate(x, n_new=args.n_tokens,

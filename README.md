@@ -45,6 +45,8 @@ Docs (FR-friendly) :
 | Doc | Contenu |
 |-----|---------|
 | [`docs/UNIVERSAL_TRAINING.md`](docs/UNIVERSAL_TRAINING.md) | Chemin universel CPU/petit GPU, configs nano/commodity, mesures |
+| [`docs/COLAB_GPU.md`](docs/COLAB_GPU.md) | **Colab T4/L4** — notebook nano, Drive, free vs Pro, transfert ckpt |
+| [`notebooks/kahnn_nano_colab.ipynb`](notebooks/kahnn_nano_colab.ipynb) | Notebook Colab-ready (`train_universal.py --config nano --device cuda`) |
 | [`docs/LIFELONG_LEARNING.md`](docs/LIFELONG_LEARNING.md) | Teach / probe / forget, mémoire sticky, limites honnêtes |
 | [`docs/CPU_RUN_LOG.md`](docs/CPU_RUN_LOG.md) | Journal daté 2026-09-08 (box 8 threads, vrais tps) |
 | [`data/DATA.md`](data/DATA.md) | Provenance corpus (~109 MB local, **non** commité) |
@@ -61,6 +63,10 @@ Docs (FR-friendly) :
 | `teach.py smoke` | probe ~**0 → ~0.96** ; pas de decay auto ; forget vide les slots |
 
 Détail : [`docs/CPU_RUN_LOG.md`](docs/CPU_RUN_LOG.md). Ship : [PR #1](https://github.com/AFKmoney/kahnn/pull/1).
+
+### GPU gratuit (Colab)
+
+Pour accélérer nano sur **T4/L4** : ouvre [`notebooks/kahnn_nano_colab.ipynb`](notebooks/kahnn_nano_colab.ipynb) dans Colab (Runtime → GPU) et suis [`docs/COLAB_GPU.md`](docs/COLAB_GPU.md). Attente : nettement plus rapide que ~1.2k tok/s CPU — **mesure le tps** sur le smoke Colab (pas de benchmark GPU inventé dans le repo).
 
 ## Architecture (1-page)
 
@@ -172,8 +178,11 @@ kahnn/
 ├── launch_b1.sh / launch_b1_rtx4090.sh
 ├── data/
 │   └── DATA.md                # corpus provenance + rebuild (corpus.txt local only)
+├── notebooks/
+│   └── kahnn_nano_colab.ipynb # ★ Colab T4/L4 nano train
 ├── docs/
 │   ├── UNIVERSAL_TRAINING.md  # ★ CPU / petit GPU
+│   ├── COLAB_GPU.md           # ★ Colab free/Pro + Drive ckpt
 │   ├── LIFELONG_LEARNING.md   # ★ continuous memory
 │   ├── CPU_RUN_LOG.md         # ★ dated measurements
 │   ├── ARCHITECTURE.md

@@ -3,6 +3,12 @@
 Objectif : entraîner un modèle Kahnn **de qualité utile** sans H100 ni
 cluster 5×4090. Entrée recommandée : `train_universal.py`.
 
+> **Pourquoi CPU-first ?** Le but produit n’est pas « multi-H100 ». C’est
+> un cerveau Kahnn qui apprend **en continu** sur machine perso / box
+> modestes, puis consolide des faits via engrammes (`teach.py`) sans
+> full retrain. Voir aussi `docs/LIFELONG_LEARNING.md` et le journal
+> daté `docs/CPU_RUN_LOG.md` (2026-09-08).
+
 ## 1. Principe
 
 La qualité n’égale pas « lancer B1 (1B params) ». Pour Kahnn :
@@ -20,7 +26,7 @@ souvent un gros modèle sous-entraîné sur un budget de quelques dollars.
 | Config | Params | Tokens Chinchilla (20×) | Cible matériel |
 |---|---|---|---|
 | `smoke` | ~0.3M | ~6M | sanity CPU |
-| `nano` | ~1.8M | ~37M | laptop CPU |
+| `nano` | ~1.8M | ~37M | laptop CPU / box 8 threads |
 | `commodity` | ~13M | ~264M | CPU fort / GPU 8–12 Go |
 | `tiny` | ~6.6M | ~132M | CPU / GPU entry |
 | `medium` | ~52M | ~1.05B | GPU 12–24 Go |
@@ -32,7 +38,7 @@ rapport qualité/prix — le FLOP budget explose (voir `docs/B1_TRAINING.md`).
 
 ```bash
 pip install -r requirements.txt
-# corpus texte (fichier ou dossier)
+# corpus texte (fichier ou dossier) — voir data/DATA.md
 
 # Auto device (cuda → mps → cpu), preset commodity
 python train_universal.py \
@@ -40,7 +46,14 @@ python train_universal.py \
   --output ./runs/commodity_auto \
   --config commodity
 
-# Laptop CPU, nano, smoke de débit
+# Laptop / box CPU, nano, Chinchilla ~37M tokens
+python train_universal.py \
+  --data ./data/corpus.txt \
+  --output ./runs/nano_base \
+  --config nano --device auto \
+  --log-every 10 --checkpoint-every 500
+
+# Smoke de débit
 python train_universal.py \
   --data /path/to/corpus \
   --output ./runs/nano_cpu \
@@ -82,7 +95,7 @@ Flags utiles :
 
 Budgets **compute** approximatifs (électricité / location Vast·RunPod),
 pas le salaire ingénieur. Les débits CPU ci-dessous sont ancrés sur des
-mesures laptop/box 8 threads ; GPU = estimation prudente MFU.
+mesures box 8 threads (2026-09-08) ; GPU = estimation prudente MFU.
 
 | Budget | Setup réaliste | Config | Tokens | Qualité attendue |
 |---|---|---|---|---|
@@ -101,27 +114,40 @@ ne supprime pas le besoin de tokens.
 1. **Curriculum de contexte** : `seq=128→256→512` (relancer avec
    `--resume` et `--seq-len` croissant).
 2. **Prétrain court + continuous** : Adam sur corpus général, puis
-   `--continuous` sur données métier (pas de replay buffer).
+   `--continuous` / `teach.py` sur données métier (pas de replay buffer).
 3. **Progressive depth** : déjà activé dans `train_universal.py`.
 4. **Données propres** > tokens bruités : 50M tokens filtrés battent
    souvent 300M web dump pour une tâche métier.
 5. **Distillation** (recommandation, non implémentée) : soft-labels
    d’un medium → nano pour compresser.
 
-## 7. Mesures CPU locales (box 8 threads, PyTorch 2.x, eager)
+## 7. Mesures CPU locales (box 8 threads, PyTorch 2.14+cpu, eager)
 
-Mesures réelles via `train_universal.py --smoke-steps` (vocab GPT-2 50k) :
+Mesures réelles 2026-09-08 — détail daté dans **`docs/CPU_RUN_LOG.md`**.
 
-| Config | micro×seq | tps observé (stable) | ETA Chinchilla (20× params) |
+### Smoke / benches courts
+
+| Config | micro×seq | tps observé | ETA Chinchilla (20× params) |
 |---|---|---|---|
-| `smoke` (~0.3M) | 4×32 | ~870–910 tok/s | n/a (sanity) |
-| `nano` (~1.8M) | 2×64 | ~560 tok/s | ~37M tokens ≈ **0.8 jour** CPU |
-| `commodity` (~13M) | 1×64 | ~145–170 tok/s | ~264M tokens ≈ **18–21 jours** CPU |
+| `smoke` (~0.3M) | 4×32 | **~870–1040** tok/s | n/a (sanity) |
+| `nano` (~1.8M) | 2×64 | ~560 tok/s | bench smoke seulement |
+| `commodity` (~13M) | 1×64 | **~145–170** tok/s | ~264M tokens ≈ **18–21 jours** CPU |
+
+### Live nano pretrain (`runs/nano_base`, micro=4 seq=256 accum=2)
+
+| Observation | Valeur |
+|---|---|
+| Target | **36,986,940** tokens (~20 tok/param, 1.86M trainable) |
+| TPS early | **~1070–1230** tok/s (steps 10–350) |
+| ETA trainer | **~8.3–9.6 h** wall (progressive-depth 1/3 ; ralentira en 2/3–3/3) |
+| Loss early | ~10.83 → ~10.38 (steps 10→350) |
+| Device log | `cpu` · `torch.set_num_threads(8)` |
 
 Notes :
 - Le decode matmul (`V×D`) domine dès que `vocab=50257` ; l’ancien broadcast OOM (~52 Go).
 - `torch.compile` nécessite un compilateur C++ (`g++`/`clang`) ; sinon fallback eager (testé).
 - Sur un GPU 8–12 Go, attendre ×20–100 vs ces tps CPU (ordre de grandeur, non mesuré ici).
+- **Ne pas** confondre le smoke `2×64` (~560 tps) avec le live `4×256` (~1.1–1.2k tps).
 
 ## 8. Anti-patterns
 
@@ -130,6 +156,7 @@ Notes :
 - Vocab GPT-2 + ancien decode (OOM) — corrigé, gardez le patch.
 - Croire les ×8.14 des upgrades FP8/MoD/PGSU sur CPU : **FP8 = Ada/Hopper
   seulement** ; sur CPU seul progressive-depth + decode/engram fixes comptent.
+- Committer `data/corpus.txt` (~109 MB) dans git — documenter + rebuild (`data/DATA.md`).
 
 ## 9. Vérifs rapides
 
@@ -155,6 +182,12 @@ et les limites honnêtes du « se souvenir pour toujours ».
 
 ```bash
 python teach.py teach --text "Fait métier…" --resume ./runs/.../ckpt_final.pt \
-  --config commodity --output ./runs/teach
+  --config nano --output ./runs/teach
 python teach.py smoke --device cpu
 ```
+
+## 11. Corpus (box)
+
+Path : `data/corpus.txt` (~109 MiB, ~46M tokens GPT-2 estimés).  
+Sources & rebuild : **`data/DATA.md`**. Le fichier binaire n’est **pas**
+dans le dépôt ; reconstruire localement avant un long run.

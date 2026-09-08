@@ -67,6 +67,11 @@ class HypervectorTokenizer(nn.Module):
         # Item memory: V random bipolar hypervectors. Not learnable.
         token_hvs = random_hypervectors(vocab_size, dim, generator=g)
         self.register_buffer("token_hvs", token_hvs)
+        # Cached L2 norms for fast matmul decode (avoids recompute every forward)
+        self.register_buffer(
+            "token_hvs_normed",
+            token_hvs / token_hvs.norm(dim=-1, keepdim=True).clamp_min(1e-5),
+        )
 
         # Positional level-HVs: P_0, P_1, ... P_{L-1} (correlated chain)
         pos_hvs = level_hypervectors(max_seq_len, dim)
@@ -111,12 +116,17 @@ class HypervectorTokenizer(nn.Module):
 
         hv: [B, ..., D] (or [D])
         Returns: logits [B, ..., V], and (top_k_indices, top_k_logits).
+
+        Uses matmul-based cosine similarity (O(N·V·D) FLOPs, O(N·V) memory)
+        instead of a broadcasted elementwise product that materializes an
+        [N, V, D] tensor (~52 GB for GPT-2 vocab × D=4096 × N=64).
         """
         lead = hv.shape[:-1]
         D = hv.shape[-1]
-        flat = hv.reshape(-1, D)                                # [N, D]
-        # cosine similarity against the full codebook
-        sims = similarity(flat.unsqueeze(1), self.token_hvs.unsqueeze(0))  # [N, V]
+        flat = hv.reshape(-1, D).float()                        # [N, D]
+        flat_n = flat / flat.norm(dim=-1, keepdim=True).clamp_min(1e-5)
+        # token_hvs_normed is a buffer built at init (fixed random codebook)
+        sims = flat_n @ self.token_hvs_normed.float().t()       # [N, V]
         logits = sims / max(temperature, 1e-6)
         out_logits = logits.reshape(*lead, self.vocab_size)
 

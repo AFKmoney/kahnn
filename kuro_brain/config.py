@@ -1,8 +1,8 @@
 """
 config.py — Pre-defined configurations for KAHNN.
 
-Sized for fast training on commodity GPUs (smoke test) up to H100
-(1B-parameter production model on 25B tokens).
+Presets from laptop-CPU smoke/nano/commodity up through H100-scale B1/XL.
+Prefer nano/commodity/tiny for cost-minimized universal training.
 """
 
 from dataclasses import dataclass, asdict
@@ -121,8 +121,45 @@ XL = KAHNNConfig(
 )
 
 
+
+# ---------------------------------------------------------------------------
+# Nano — laptop CPU, ~0.8M params, curriculum / continuous-learning friendly
+# ---------------------------------------------------------------------------
+
+NANO = KAHNNConfig(
+    vocab_size=50257,
+    dim=2048,
+    n_layers=3,
+    max_seq_len=512,
+    kuramoto_steps=2,
+    kuramoto_rank=48,
+    n_ensembles_per_layer=12,
+    use_hrr_mlp=True,
+    mlp_rank=96,
+)
+
+# ---------------------------------------------------------------------------
+# Commodity — single consumer GPU (8–12 GB) or strong multi-core CPU.
+# ~18M params → Chinchilla-optimal ≈ 360M tokens. Designed for $0–$50 budgets.
+# ---------------------------------------------------------------------------
+
+COMMODITY = KAHNNConfig(
+    vocab_size=50257,
+    dim=4096,
+    n_layers=6,
+    max_seq_len=1024,
+    kuramoto_steps=3,
+    kuramoto_rank=64,
+    n_ensembles_per_layer=24,
+    use_hrr_mlp=True,
+    mlp_rank=192,
+    cross_layer_memory_capacity=128,
+)
+
 CONFIGS = {
     "smoke": SMOKE,
+    "nano": NANO,
+    "commodity": COMMODITY,
     "tiny": TINY,
     "medium": MEDIUM,
     "large": LARGE,

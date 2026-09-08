@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-train_universal.py — Cost-minimized Kahnn training on CPU / small GPU / MPS.
+train_universal.py -- Cost-minimized Kahnn training on CPU / small GPU / MPS.
 
 This is the recommended entrypoint when you do NOT have H100 / multi-4090
 hardware. It auto-picks a device, chooses a commodity-friendly config, and
@@ -8,27 +8,16 @@ enables CPU-safe speedups (threaded BLAS, matmul decode, cheap engram pull,
 optional torch.compile, progressive depth, optional continuous learning).
 
 Examples:
-  # Laptop CPU, nano model, 20M tokens
-  python train_universal.py --data ./corpus.txt --output ./runs/nano_cpu \\
-      --config nano --max-tokens 20000000
-
-  # Auto device + commodity preset (default)
-  python train_universal.py --data ./corpus --output ./runs/commodity \\
-      --config commodity --max-tokens 260000000
-
-  # Small CUDA GPU if present, else CPU
-  python train_universal.py --data ./corpus --output ./runs/auto --device auto
-
-  # Post-pretrain continuous learning (no Adam — local plasticity + engrams)
-  python train_universal.py --data ./new_domain.txt --output ./runs/cont \\
-      --config commodity --continuous --resume ./runs/commodity/ckpt_final.pt
+  python train_universal.py --data ./corpus --output ./runs/x --config nano
+  python train_universal.py --data ./new --output ./runs/c --continuous --resume CKPT
+  python train_universal.py ... --continuous --soft-decay   # optional weak decay
+  # teach/forget: see teach.py + docs/LIFELONG_LEARNING.md
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import sys
 import time
 from pathlib import Path
@@ -70,7 +59,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1337)
     p.add_argument("--resume", default=None)
     p.add_argument("--continuous", action="store_true",
-                   help="Disable Adam; local plasticity + engrams only.")
+                   help="Disable Adam; local plasticity + lifelong engrams.")
+    p.add_argument("--soft-decay", action="store_true",
+                   help="With --continuous: age low-usage engram slots only. "
+                        "Default OFF so memory persists until teach.py forget.")
     p.add_argument("--enable-plasticity", action="store_true",
                    help="Also run local plasticity during Adam pretraining "
                         "(slower; usually unnecessary).")
@@ -131,7 +123,7 @@ def main():
     if args.max_tokens is None:
         args.max_tokens = int(20 * n_params)
 
-    log(f"[device] {info.kind} ({info.name}) — {info.notes}")
+    log(f"[device] {info.kind} ({info.name}) -- {info.notes}")
     log(f"[config] {describe_config(cfg)}")
     log(f"[batch] micro={micro} seq={seq} accum={accum} "
         f"tokens/step={micro * seq * accum:,}")
@@ -176,10 +168,19 @@ def main():
         )
         log(f"[optim] AdamW lr={args.lr}")
     else:
-        log("[mode] continuous learning (no Adam)")
+        log("[optim] none (continuous mode)")
 
-    learner = OnlineLearner(model, cfg, base_optimizer=optimizer,
-                            continuous_mode=args.continuous)
+    learner = OnlineLearner(
+        model, cfg, base_optimizer=optimizer,
+        continuous_mode=args.continuous,
+        soft_decay=bool(args.soft_decay),
+    )
+    if args.continuous:
+        if args.soft_decay:
+            log("[mode] continuous + soft_decay (weak slots only)")
+        else:
+            log("[mode] continuous lifelong (no auto engram decay; "
+                "use teach.py forget to erase)")
     if args.enable_plasticity:
         learner.enable_local_plasticity = True
         log("[plasticity] enabled during pretrain (extra cost)")
@@ -221,7 +222,7 @@ def main():
     t0 = time.time()
     running_loss = 0.0
     running_n = 0
-    log(f"[train] start — total_steps≈{total_steps:,} warmup={warmup}")
+    log(f"[train] start -- total_steps~{total_steps:,} warmup={warmup}")
 
     accum_i = 0
     if optimizer is not None:

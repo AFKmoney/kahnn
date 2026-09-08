@@ -10,6 +10,7 @@ Key properties:
   - Async prefetch on a worker thread
   - Batches are formed by concatenating tokens with EOS boundaries
   - Each batch is [B, T] long tensor + same shifted for next-token target
+  - Literal `<|endoftext|>` in corpus text does not crash encoding
 """
 
 from __future__ import annotations
@@ -49,6 +50,28 @@ def build_tokenizer(name: str = "gpt2"):
         return ByteTok(), 256
 
 
+def encode_text(tokenizer, text: str) -> list[int]:
+    """
+    Encode text without crashing on literal special tokens in the corpus.
+
+    tiktoken's default ``encode`` raises ValueError when it sees
+    ``<|endoftext|>``. For streaming corpora that may contain that string
+    as ordinary text, prefer ``encode_ordinary`` (treat as normal BPE),
+    then ``encode(..., allowed_special=...)``, then plain ``encode``.
+    """
+    encode_ordinary = getattr(tokenizer, "encode_ordinary", None)
+    if callable(encode_ordinary):
+        return encode_ordinary(text)
+    encode = getattr(tokenizer, "encode", None)
+    if not callable(encode):
+        raise TypeError(f"tokenizer has no encode: {type(tokenizer)!r}")
+    try:
+        return encode(text, allowed_special={"<|endoftext|>"})
+    except TypeError:
+        # ByteTok / callables that only accept the string
+        return encode(text)
+
+
 # ---------------------------------------------------------------------------
 # Streaming corpus
 # ---------------------------------------------------------------------------
@@ -85,7 +108,7 @@ class StreamingCorpus:
                     chunk = fh.read(self.chunk_size)
                     if not chunk:
                         break
-                    ids = self.tokenizer.encode(chunk)
+                    ids = encode_text(self.tokenizer, chunk)
                     for i in ids:
                         yield i
                 yield self.eos_id

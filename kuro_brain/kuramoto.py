@@ -130,9 +130,41 @@ class KuramotoLayer(nn.Module):
         self.engrams.data[slot] = 0.9 * self.engrams.data[slot] + 0.1 * theta
         return slot
 
+    @torch.no_grad()
+    def forget_engram(self, slot: int):
+        """Explicitly clear one per-layer engram slot."""
+        self.engrams.data[slot].zero_()
+
+    @torch.no_grad()
+    def forget_matching(self, theta: Tensor, min_coherence: float = 0.45) -> list[int]:
+        """Clear per-layer engram slots whose phase coherence with theta is high."""
+        if theta.dim() == 2:
+            theta = theta.mean(dim=0)
+        diff = self.engrams.data - theta.unsqueeze(0)
+        coh = torch.cos(diff).mean(dim=-1)
+        cleared = []
+        for s in range(self.n_ensembles):
+            if float(coh[s].item()) >= min_coherence:
+                self.engrams.data[s].zero_()
+                cleared.append(s)
+        return cleared
+
+    @torch.no_grad()
+    def probe(self, theta: Tensor) -> Tensor:
+        """Return [E] mean cos-coherence of theta vs each engram slot."""
+        if theta.dim() == 2:
+            theta = theta.mean(dim=0)
+        diff = self.engrams.data - theta.unsqueeze(0)
+        return torch.cos(diff).mean(dim=-1)
+
 
 class AttractorMemory(nn.Module):
-    """Cross-layer attractor memory (hippocampal-style)."""
+    """Cross-layer attractor memory (hippocampal-style).
+
+    Lifelong default: usage never auto-decays, so consolidated slots stay
+    preferred (high usage) and are not overwritten by argmin eviction unless
+    the user calls forget_* or enables soft decay of weak slots.
+    """
 
     def __init__(self, n_layers: int, dim: int, capacity: int = 256):
         super().__init__()
@@ -164,5 +196,73 @@ class AttractorMemory(nn.Module):
         return gain * pull
 
     @torch.no_grad()
-    def decay(self, rate: float = 0.999):
-        self.usage.mul_(rate)
+    def decay(
+        self,
+        rate: float = 0.999,
+        only_weak: bool = False,
+        usage_threshold: float = 0.5,
+    ):
+        """Decay usage counters (does not wipe attractor values).
+
+        Global decay makes *all* slots easier to overwrite — avoid in
+        lifelong continuous mode. Prefer only_weak=True to age low-usage
+        slots only, or skip decay entirely (default lifelong policy).
+        """
+        if not only_weak:
+            self.usage.mul_(rate)
+            return
+        weak = self.usage < usage_threshold
+        self.usage = torch.where(weak, self.usage * rate, self.usage)
+
+    @torch.no_grad()
+    def forget_slot(self, layer_idx: int, slot: int):
+        """Explicitly erase one cross-layer memory slot."""
+        self.attractors[layer_idx, slot].zero_()
+        self.usage[layer_idx, slot] = 0.0
+
+    @torch.no_grad()
+    def forget_matching(
+        self,
+        theta: Tensor,
+        min_coherence: float = 0.45,
+        layers: list[int] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Erase attractor slots matching theta (phase cos-coherence)."""
+        if theta.dim() == 2:
+            theta = theta.mean(dim=0)
+        layer_ids = layers if layers is not None else list(range(self.n_layers))
+        cleared: list[tuple[int, int]] = []
+        for li in layer_ids:
+            diff = self.attractors[li] - theta.unsqueeze(0)
+            coh = torch.cos(diff).mean(dim=-1)
+            for s in range(self.capacity):
+                if float(coh[s].item()) >= min_coherence:
+                    self.forget_slot(li, s)
+                    cleared.append((li, s))
+        return cleared
+
+    @torch.no_grad()
+    def forget_all(self):
+        """Wipe entire cross-layer memory (explicit user request only)."""
+        self.attractors.zero_()
+        self.usage.zero_()
+
+    @torch.no_grad()
+    def probe(self, theta: Tensor, layer_idx: int | None = None) -> Tensor:
+        """Return coherence of theta vs attractors.
+
+        layer_idx set -> [capacity]; else -> [n_layers, capacity].
+        """
+        if theta.dim() == 2:
+            theta = theta.mean(dim=0)
+        if layer_idx is not None:
+            diff = self.attractors[layer_idx] - theta.unsqueeze(0)
+            return torch.cos(diff).mean(dim=-1)
+        # [L, C]
+        diff = self.attractors - theta.view(1, 1, -1)
+        return torch.cos(diff).mean(dim=-1)
+
+    def occupied_count(self, usage_eps: float = 0.5) -> int:
+        """Count slots with real writes (usage += 1.0), ignoring the tiny
+        global +1e-3 bump applied on every write."""
+        return int((self.usage >= usage_eps).sum().item())

@@ -36,6 +36,8 @@ rapport qualité/prix — le FLOP budget explose (voir `docs/B1_TRAINING.md`).
 
 ## 3. Lancement
 
+GPU gratuit : voir aussi [`docs/COLAB_GPU.md`](COLAB_GPU.md) + [`notebooks/kahnn_nano_colab.ipynb`](../notebooks/kahnn_nano_colab.ipynb) (T4/L4 ; mesurer le tps sur place).
+
 ```bash
 pip install -r requirements.txt
 # corpus texte (fichier ou dossier) — voir data/DATA.md

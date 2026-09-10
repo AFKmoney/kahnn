@@ -1,4 +1,4 @@
-# CPU run log / journal d’expériences — 2026-09-08
+# CPU run log / journal d’expériences — 2026-09-08 → 2026-09-09 (FINAL nano)
 
 Mesures **réelles** uniquement (box Cursor / AFKmoney Kahnn). Aucun chiffre inventé.
 Fuseau utilisateur : America/Toronto (UTC−4). Timestamps ci-dessous en **PT**.
@@ -120,6 +120,73 @@ python train_universal.py \
 
 ETA wall-clock annoncée par le trainer : **~8.3–9.6 h** pour ~37M tokens à ce débit (sujet à ralentissement quand progressive-depth passe à 2/3 puis 3/3).
 
+### Crash tiktoken EOT (~step 2000) + fix PR #4
+
+Vers **step ~2000** (`ckpt_2000.pt`, ~4.1M tokens), le run a planté :
+
+```text
+ValueError: Encountered text corresponding to disallowed special token '<|endoftext|>'.
+```
+
+Cause : le corpus contient le marqueur littéral GPT-2 `<|endoftext|>` ; `tiktoken.encode` le refuse par défaut.
+
+**Fix** (mergé dans PR [#4](https://github.com/AFKmoney/kahnn/pull/4) — `ee53dbd`) :
+`data.encode_text` / `encode_ordinary` (+ harden `teach.py` / `generate.py`). Resume :
+
+```bash
+python train_universal.py \
+  --data /workspace/kahnn/data/corpus.txt \
+  --output /workspace/kahnn/runs/nano_base \
+  --config nano --device auto \
+  --resume /workspace/kahnn/runs/nano_base/ckpt_2000.pt
+```
+
+Log : `[resume] step=2000 tokens=4,096,000`.
+
+### FINAL nano (2026-09-09) — `ckpt_final.pt`
+
+Mesure réelle du log `runs/nano_base/console.out` :
+
+| Champ | Valeur |
+|-------|--------|
+| Fichier | `runs/nano_base/ckpt_final.pt` (~856 MiB, **gitignored**) |
+| Tokens | **36,987,904** (`[done]`) |
+| tps final | **≈1361.7** tok/s (layers **3/3**) |
+| Last loss | **≈10.50** (`step=18060` loss=`10.5002`) |
+| Wall resume | **~7.5 h** de train après resume `ckpt_2000` (post fix tiktoken) |
+| Calendrier total | **~10 h** incluant le crash EOT + downtime + resume |
+
+Extrait fin de run :
+
+```text
+step=18050 tokens=36,966,400 loss=10.4908 tps=1361.7 layers=3/3 eta=0.0h
+step=18060 tokens=36,986,880 loss=10.5002 tps=1361.7 layers=3/3 eta=0.0h
+[done] tokens=36,987,904 tps=1361.7 saved=.../runs/nano_base/ckpt_final.pt
+```
+
+**Poids non versionnés** — voir [`NANO_FINAL.md`](./NANO_FINAL.md) (chemins locaux + upload Drive/HF).
+
+### Teach sur `ckpt_final` (2026-09-09)
+
+```bash
+python teach.py teach --text "La capitale du Canada est Ottawa." \
+  --config nano --resume ./runs/nano_base/ckpt_final.pt \
+  --output ./runs/teach
+
+python teach.py probe --text "capitale du Canada" \
+  --resume ./runs/teach/ckpt_teach.pt --config nano
+```
+
+| Métrique | Valeur observée |
+|----------|-----------------|
+| `probe_best_memory` (après teach) | **~1.00** (`0.9999985…`) |
+| `occupied` | **570** |
+| CE loss pendant teach | **~10.8** (`loss_mean≈10.828`) |
+| Probe partiel `"capitale du Canada"` | **~0.43** (`best_memory≈0.4256`) |
+| Checkpoint teach | `runs/teach/ckpt_teach.pt` (gitignored) |
+
+**Honnêteté :** consolidation mémoire OK ; **génération encore pauvre** (CE ~10.8). Nano Chinchilla CPU = base de départ, pas un LLM fluide. Détail : [`NANO_FINAL.md`](./NANO_FINAL.md).
+
 ### Après le run
 
 ```bash
@@ -151,5 +218,6 @@ python teach.py forget --text "…" --resume ./runs/teach/ckpt_teach.pt --config
 
 - Produit / quickstart CPU : [`UNIVERSAL_TRAINING.md`](./UNIVERSAL_TRAINING.md)
 - Lifelong teach/forget : [`LIFELONG_LEARNING.md`](./LIFELONG_LEARNING.md)
+- Récap FINAL nano + poids locaux : [`NANO_FINAL.md`](./NANO_FINAL.md)
 - Corpus : [`../data/DATA.md`](../data/DATA.md)
 - Cluster / B1 (secondaire) : [`B1_TRAINING.md`](./B1_TRAINING.md), [`RTX4000_TRAINING.md`](./RTX4000_TRAINING.md)

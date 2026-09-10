@@ -6,7 +6,8 @@ connaissance consolidée reste jusqu’à ce que l’utilisateur demande
 explicitement de l’oublier.
 
 > Produit : CPU-first + continuous learning, **pas** multi-H100.
-> Journal mesures 2026-09-08 : `docs/CPU_RUN_LOG.md`.
+> Journal mesures 2026-09-08 → 2026-09-09 : `docs/CPU_RUN_LOG.md`.
+> Récap FINAL nano + poids : `docs/NANO_FINAL.md`.
 > Prétrain universel : `docs/UNIVERSAL_TRAINING.md`.
 
 ## 1. Ce que ça fait (et ce que ça ne fait pas)
@@ -117,6 +118,22 @@ python teach.py smoke --device cpu   # régression synthétique
 | forget | slots cleared, occupied → 0 |
 
 Détail : `docs/CPU_RUN_LOG.md` §3.
+
+
+## 5b. Teach réel sur `ckpt_final` (2026-09-09)
+
+Après prétrain nano complet (`tokens=36,987,904`, `tps≈1361.7`, last loss≈10.50) :
+
+| Métrique | Valeur |
+|----------|--------|
+| Texte | `"La capitale du Canada est Ottawa."` |
+| `probe_best_memory` | **~1.00** |
+| `occupied` | **570** |
+| CE loss teach | **~10.8** |
+| Probe `"capitale du Canada"` | **~0.43** |
+| Ckpt | `runs/teach/ckpt_teach.pt` (local only) |
+
+Génération encore pauvre (CE élevé). Poids **hors git** — chemins + upload Drive/HF : [`NANO_FINAL.md`](./NANO_FINAL.md).
 
 ## 6. Limites honnêtes du « no forgetting »
 

@@ -79,9 +79,50 @@ def parse_args():
     p.add_argument("--activation-checkpointing", action="store_true",
                    help="Save activation memory on small GPUs.")
     p.add_argument("--prefetch", type=int, default=4)
+    p.add_argument("--head-lr-mult", type=float, default=1.0,
+                   help="LR multiplier for output head (logit scale + bias).")
+    p.add_argument("--init-bias-unigram", action="store_true",
+                   help="Init output bias to log unigram freqs of the train "
+                        ".bin (standard LM head init; needs .bin data).")
+    p.add_argument("--val-data", default=None,
+                   help="uint16 .bin of held-out tokens (scripts/tokenize_corpus.py).")
+    p.add_argument("--eval-every", type=int, default=200)
+    p.add_argument("--eval-batches", type=int, default=16)
+    p.add_argument("--grow-frac", type=float, default=0.3,
+                   help="Progressive depth: reach full depth by this fraction "
+                        "of training (was: spread over the whole run).")
     p.add_argument("--smoke-steps", type=int, default=0,
                    help="If >0, run only N steps then exit (throughput check).")
     return p.parse_args()
+
+
+class BinBatcher:
+    """Random (or sequential) windows from a uint16 token .bin (memmap)."""
+
+    def __init__(self, path, batch, seq, device, seed=0, sequential=False):
+        import numpy as np
+        self.np = np
+        self.data = np.memmap(path, dtype=np.uint16, mode="r")
+        self.batch, self.seq, self.device = batch, seq, device
+        self.rng = np.random.default_rng(seed)
+        self.sequential = sequential
+
+    def __iter__(self):
+        np = self.np
+        n = len(self.data) - self.seq - 1
+        pos = 0
+        while True:
+            if self.sequential:
+                starts = (pos + np.arange(self.batch) * (self.seq + 1)) % n
+                pos += self.batch * (self.seq + 1)
+            else:
+                starts = self.rng.integers(0, n, self.batch)
+            w = np.stack([self.data[s:s + self.seq + 1] for s in starts]).astype(np.int64)
+            w = torch.from_numpy(w).to(self.device)
+            yield w[:, :-1], w[:, 1:]
+
+    def close(self):
+        pass
 
 
 def lr_at_step(step, total_steps, warmup, base_lr, min_lr_frac=0.1):
@@ -151,11 +192,13 @@ def main():
 
     optimizer = None
     if not args.continuous:
-        decay, no_decay = [], []
+        decay, no_decay, head = [], [], []
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim < 2 or n.endswith(("K", "engram_gain", "gate")):
+            if n in ("out_bias", "logit_log_scale"):
+                head.append(p)
+            elif p.ndim < 2 or n.endswith(("K", "engram_gain", "gate")):
                 no_decay.append(p)
             else:
                 decay.append(p)
@@ -163,6 +206,8 @@ def main():
             [
                 {"params": decay, "weight_decay": args.weight_decay},
                 {"params": no_decay, "weight_decay": 0.0},
+                {"params": head, "weight_decay": 0.0,
+                 "lr_mult": args.head_lr_mult},
             ],
             lr=args.lr, betas=(0.9, 0.95), eps=1e-8,
         )
@@ -192,13 +237,22 @@ def main():
     if args.progressive_depth and cfg.n_layers >= 3:
         initial = args.initial_layers or max(1, cfg.n_layers // 3)
         grow_every = args.grow_every_steps or max(
-            1, total_steps // max(1, cfg.n_layers - initial + 1)
+            1, int(total_steps * args.grow_frac) // max(1, cfg.n_layers - initial)
         )
         model.set_active_layers(initial)
         log(f"[progressive-depth] {initial}/{cfg.n_layers}, "
             f"grow_every={grow_every}")
     else:
         initial, grow_every = cfg.n_layers, None
+
+    if args.init_bias_unigram and getattr(model, "out_bias", None) is not None \
+            and str(args.data).endswith(".bin"):
+        import numpy as np
+        arr = np.memmap(args.data, dtype=np.uint16, mode="r")[:5_000_000]
+        cnt = np.bincount(arr, minlength=cfg.vocab_size).astype(np.float64) + 0.5
+        with torch.no_grad():
+            model.out_bias.copy_(torch.from_numpy(np.log(cnt / cnt.sum())).float())
+        log("[head] out_bias initialised to log unigram (first 5M train tokens)")
 
     start_step = 0
     tokens_seen = 0
@@ -211,11 +265,38 @@ def main():
         tokens_seen = int(ckpt.get("tokens", 0))
         log(f"[resume] step={start_step} tokens={tokens_seen:,}")
 
-    corpus = StreamingCorpus(args.data, tokenizer, eos_id=eos_id)
-    batcher = TokenBatcher(
-        corpus, batch_size=micro, seq_len=seq,
-        device=device, prefetch=args.prefetch,
-    )
+    if str(args.data).endswith(".bin"):
+        batcher = BinBatcher(args.data, micro, seq, device, seed=args.seed)
+    else:
+        corpus = StreamingCorpus(args.data, tokenizer, eos_id=eos_id)
+        batcher = TokenBatcher(
+            corpus, batch_size=micro, seq_len=seq,
+            device=device, prefetch=args.prefetch,
+        )
+    val_x = val_y = None
+    if args.val_data:
+        vb = BinBatcher(args.val_data, micro, seq, device, seed=12345,
+                        sequential=True)
+        it = iter(vb)
+        pairs = [next(it) for _ in range(args.eval_batches)]
+        val_x = [p[0] for p in pairs]; val_y = [p[1] for p in pairs]
+        log(f"[val] {args.eval_batches * micro * seq:,} held-out tokens")
+    csv_path = out_dir / "metrics.csv"
+    if not csv_path.exists() or start_step == 0:
+        csv_path.write_text("step,tokens,train_loss,val_loss,lr,tps,layers,elapsed_s\n")
+
+    def evaluate():
+        if val_x is None:
+            return float("nan")
+        was = model.training
+        model.eval()
+        tot = 0.0
+        with torch.no_grad():
+            for vx, vy in zip(val_x, val_y):
+                lg = model(vx)
+                tot += float(F.cross_entropy(lg.reshape(-1, cfg.vocab_size), vy.reshape(-1)))
+        model.train(was)
+        return tot / len(val_x)
 
     use_amp = info.amp_dtype is not None and info.kind == "cuda"
     step = start_step
@@ -238,7 +319,7 @@ def main():
             if optimizer is not None:
                 lr = lr_at_step(step, total_steps, warmup, args.lr)
                 for g in optimizer.param_groups:
-                    g["lr"] = lr
+                    g["lr"] = lr * g.get("lr_mult", 1.0)
 
             if use_amp:
                 with torch.autocast(device_type="cuda", dtype=info.amp_dtype):
@@ -283,7 +364,15 @@ def main():
                 msg = (f"step={step} tokens={tokens_seen:,} loss={avg:.4f} "
                        f"tps={tps:.1f} layers={model.n_active_layers}/{cfg.n_layers} "
                        f"eta={eta_h:.1f}h")
+                vl = float("nan")
+                if val_x is not None and step % args.eval_every == 0:
+                    vl = evaluate()
+                    msg += f" val={vl:.4f}"
                 log(msg)
+                cur_lr = optimizer.param_groups[0]["lr"] if optimizer else 0.0
+                with open(csv_path, "a") as fh:
+                    fh.write(f"{step},{tokens_seen},{avg:.5f},{vl:.5f},{cur_lr:.3e},"
+                             f"{tps:.1f},{model.n_active_layers},{dt:.1f}\n")
                 running_loss = 0.0
                 running_n = 0
 
@@ -315,6 +404,12 @@ def main():
     torch.save(payload, ckpt_path)
     dt = time.time() - t0
     tps = tokens_seen / max(dt, 1e-6)
+    if val_x is not None:
+        vl = evaluate()
+        log(f"[final-val] val_loss={vl:.4f}")
+        with open(csv_path, "a") as fh:
+            fh.write(f"{step},{tokens_seen},nan,{vl:.5f},0,{tps:.1f},"
+                     f"{model.n_active_layers},{dt:.1f}\n")
     log(f"[done] tokens={tokens_seen:,} tps={tps:.1f} saved={ckpt_path}")
 
 

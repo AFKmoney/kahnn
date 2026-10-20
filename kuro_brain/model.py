@@ -83,6 +83,11 @@ class KAHNNConfig:
     mod_skip_rate: float = 0.5            # fraction of tokens that skip each layer
     use_activation_checkpointing: bool = False  # recompute fwd in bwd
     use_cached_fft: bool = False          # cache FFT of input HV across layers
+    # Learning fixes (see docs/LOSS_DEBUG.md)
+    use_context: bool = True              # causal holographic trace (sequence mixing)
+    learnable_logit_scale: bool = True    # cosine logits need a temperature
+    logit_scale_init: float = 10.0
+    use_output_bias: bool = True          # learnable per-token bias (unigram prior)
 
     def param_count(self) -> int:
         """Estimate trainable parameter count."""
@@ -93,6 +98,12 @@ class KAHNNConfig:
             total += L * 2 * D * self.mlp_rank
         if self.use_mod:
             total += L * 4 * 1 + L * 1   # router linear: 4 features -> 1 logit per layer
+        if self.use_context:
+            total += L * (D + 1)
+        if self.learnable_logit_scale:
+            total += 1
+        if self.use_output_bias:
+            total += self.vocab_size
         return total
 
 
@@ -134,6 +145,47 @@ class HRRMLP(nn.Module):
         return self.gate * phase_out + (1 - self.gate) * low
 
 
+class HoloContext(nn.Module):
+    """
+    Causal holographic trace -- the sequence-mixing path KAHNN was missing.
+
+    For every oscillator/frequency d it keeps a leaky superposition of the
+    *previous* token states:
+
+        c_t[d] = sum_{s<t} lambda_d^(t-1-s) * x_s[d]
+
+    with a learnable per-dimension decay lambda_d in (0, 1). Dims are
+    initialised with decays spread from fast (~0.5) to slow (~0.995), so the
+    trace holds several time-scales at once. This is HRR bundling over time
+    (no attention, no softmax over positions); it is computed in parallel as
+    a causal convolution along T via FFT, O(B*D*T log T), and
+    autoregressively it is an O(D) recurrent update.
+
+    Output: normalize(x + gain * c)  (strictly causal: c_t uses s < t).
+    """
+
+    def __init__(self, dim: int):
+        super().__init__()
+        lam = torch.linspace(0.5, 0.995, dim)
+        lam = lam[torch.randperm(dim, generator=torch.Generator().manual_seed(7))]
+        self.decay_logit = nn.Parameter(torch.log(lam / (1 - lam)))
+        self.gain = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, T, D = x.shape
+        lam = torch.sigmoid(self.decay_logit).clamp(1e-4, 1 - 1e-4)   # [D]
+        t = torch.arange(T, device=x.device, dtype=x.dtype).unsqueeze(1)
+        kern = torch.exp(t * torch.log(lam).unsqueeze(0))             # [T, D]
+        # Normalise so the trace magnitude is O(1) regardless of decay.
+        kern = kern * (1 - lam).sqrt().unsqueeze(0)
+        n = 2 * T
+        Xf = torch.fft.rfft(x, n=n, dim=1)
+        Kf = torch.fft.rfft(kern, n=n, dim=0).unsqueeze(0)
+        c = torch.fft.irfft(Xf * Kf, n=n, dim=1)[:, :T]               # includes s<=t
+        c = torch.cat([torch.zeros_like(c[:, :1]), c[:, :-1]], dim=1)   # strictly s<t
+        return normalize(x + self.gain * c)
+
+
 class KAHNN(nn.Module):
     """
     Kuramoto-Attractor Holographic Hypervector Network.
@@ -172,6 +224,21 @@ class KAHNN(nn.Module):
             ])
         else:
             self.mod_routers = None
+
+        self.contexts = nn.ModuleList([
+            HoloContext(cfg.dim) for _ in range(cfg.n_layers)
+        ]) if getattr(cfg, "use_context", False) else None
+
+        # Output head on the fixed codebook: cosine sims are in [-1, 1], which
+        # over V=50k tokens caps the reachable loss at ~ln(V)-1 (~9.8). A
+        # learnable temperature + per-token bias lets the model shape p(y).
+        if getattr(cfg, "learnable_logit_scale", False):
+            self.logit_log_scale = nn.Parameter(
+                torch.tensor(math.log(cfg.logit_scale_init)))
+        else:
+            self.logit_log_scale = None
+        self.out_bias = (nn.Parameter(torch.zeros(cfg.vocab_size))
+                         if getattr(cfg, "use_output_bias", False) else None)
 
         self.memory = AttractorMemory(
             n_layers=cfg.n_layers,
@@ -225,12 +292,12 @@ class KAHNN(nn.Module):
         # Make the newly-activated layer near-identity at first
         if self.mlps is not None:
             mlp = self.mlps[new_idx]
-            # Gate at 0 → output is half phase_filter, half low-rank residual.
-            # Push it to 0 and zero the low-rank so the layer is closer to identity.
-            mlp.gate.data.fill_(0.0)
-            mlp.A.data.zero_()
+            # Zero only the *output* side (B, phase_filter) so the MLP starts
+            # as a no-op but still receives gradient. (Previously A, B,
+            # phase_filter AND gate were all zeroed: every gradient into the
+            # MLP was then exactly 0 and grown layers' MLPs stayed dead.)
             mlp.B.data.zero_()
-            mlp.phase_filter.data.zero_()  # phase_filter=0 → IFFT(0)=0
+            mlp.phase_filter.data.zero_()
         # Also shrink the Kuramoto layer's K so the first forward pass
         # barely perturbs the state.
         self.layers[new_idx].K.data.fill_(0.01)
@@ -289,8 +356,12 @@ class KAHNN(nn.Module):
                     training=self.training,
                 )                                               # [B, T, 1] bool
 
+            ctx = self.contexts[i] if self.contexts is not None else None
+
             # Compute the layer transformation (with optional checkpointing)
             def _layer_fn(x_in):
+                if ctx is not None:
+                    x_in = ctx(x_in)
                 y = layer(x_in, return_states=False)
                 if mlp is not None:
                     delta = mlp(y)
@@ -325,6 +396,10 @@ class KAHNN(nn.Module):
 
         # Decode final hypervector state to vocab logits
         logits, _ = self.tokenizer.decode(x, top_k=1)
+        if self.logit_log_scale is not None:
+            logits = logits * self.logit_log_scale.clamp(max=math.log(100.0)).exp()
+        if self.out_bias is not None:
+            logits = logits + self.out_bias
         return logits
 
     # ------------------------------------------------------------------

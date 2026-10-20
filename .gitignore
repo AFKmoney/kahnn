@@ -14,3 +14,4 @@ data/corpus.txt
 data/raw/
 data/code/
 !data/DATA.md
+data/tok/

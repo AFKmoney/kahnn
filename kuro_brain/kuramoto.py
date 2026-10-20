@@ -90,7 +90,7 @@ class KuramotoLayer(nn.Module):
 
         omega = self.omega
         dtheta = omega + (self.K / math.sqrt(max(1.0, self.dim))) * coupling
-        if self.noise > 0:
+        if self.noise > 0 and self.training:
             dtheta = dtheta + self.noise * torch.randn_like(theta)
 
         if mask is not None:
